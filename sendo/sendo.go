@@ -1,62 +1,73 @@
 // Package sendo is the library behind the sendo command line:
-// the HTTP client, request shaping, and the typed data models for sendo.
+// the HTTP client, API parsing, and typed data models for Sendo
+// (sendo.vn), a major Vietnamese e-commerce marketplace.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Sendo exposes an internal JSON API for product details. Listing pages
+// and search results are parsed from HTML via JSON-LD or regex extraction.
+// Product URLs follow the pattern: https://www.sendo.vn/{slug}-{id}.html.
 package sendo
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to sendo. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "sendo/dev (+https://github.com/tamnd/sendo-cli)"
+// Host is the canonical site hostname.
+const Host = "sendo.vn"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at sendo.com; change it once you
-// know the real endpoints you want to read.
-const Host = "sendo.com"
+// baseURL is the site root with www prefix (required for API).
+const baseURL = "https://www.sendo.vn"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// DefaultUserAgent mimics a real browser to avoid Cloudflare blocks.
+const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
-// Client talks to sendo over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds the tunable knobs for the HTTP client.
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible production defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   baseURL,
+		Rate:      2 * time.Second,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the Sendo website over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	last time.Time
+}
+
+// NewClient returns a Client from DefaultConfig.
+func NewClient() *Client { return NewClientWithConfig(DefaultConfig()) }
+
+// NewClientWithConfig returns a Client built from cfg.
+func NewClientWithConfig(cfg Config) *Client {
+	return &Client{cfg: cfg, http: &http.Client{Timeout: cfg.Timeout}}
+}
+
+// Get fetches rawURL and returns the body bytes, pacing and retrying on transient errors.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +75,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +84,20 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "text/html,application/json,*/*")
+	req.Header.Set("Referer", baseURL+"/")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -98,18 +111,14 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	}
 
 	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
+	return b, err != nil, err
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +132,266 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on sendo.com. It is a stand-in for the typed records you
-// will model from the real sendo endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `sendo cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- wire types (Sendo internal API) ---
+
+type wireDetailResp struct {
+	Result wireProduct `json:"result"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+type wireProduct struct {
+	ID              int64          `json:"id"`
+	Name            string         `json:"name"`
+	Price           float64        `json:"price"`
+	OriginalPrice   float64        `json:"original_price"`
+	DiscountPercent int            `json:"discount_percent"`
+	Rating          float64        `json:"rating"`
+	ReviewCount     int            `json:"review_count"`
+	SoldCount       int64          `json:"order_count"`
+	IsAuthentic     bool           `json:"is_authentic"`
+	IsFreeShip      bool           `json:"is_freeship"`
+	Location        string         `json:"location"`
+	Seller          wireSeller     `json:"shop"`
+	Images          []string       `json:"images"`
+	Attributes      []wireAttr     `json:"attributes"`
+	CategoryPath    []wireCatCrumb `json:"category"`
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+type wireSeller struct {
+	ID     int64   `json:"id"`
+	Name   string  `json:"shop_name"`
+	Rating float64 `json:"rating"`
+}
+
+type wireAttr struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type wireCatCrumb struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+}
+
+// wireListingProduct is extracted from listing page JSON-LD or JSON blobs.
+type wireListingProduct struct {
+	ID    int64   `json:"id"`
+	Name  string  `json:"name"`
+	Price float64 `json:"price"`
+}
+
+// --- public types ---
+
+// Product is one Sendo product fetched from the internal API.
+type Product struct {
+	ID              string  `json:"id"                         kit:"id" table:"id"`
+	Name            string  `json:"name"                                table:"name"`
+	URL             string  `json:"url,omitempty"                       table:"url,url"`
+	Price           float64 `json:"price"                               table:"price"`
+	OriginalPrice   float64 `json:"original_price,omitempty"            table:"original_price"`
+	DiscountPercent int     `json:"discount_percent,omitempty"          table:"discount_percent"`
+	SellerName      string  `json:"seller_name,omitempty"               table:"seller_name"`
+	SellerRating    float64 `json:"seller_rating,omitempty"             table:"seller_rating"`
+	Rating          float64 `json:"rating,omitempty"                    table:"rating"`
+	ReviewCount     int     `json:"review_count,omitempty"              table:"reviews"`
+	SoldCount       int64   `json:"sold_count,omitempty"                table:"sold"`
+	IsAuthentic     bool    `json:"is_authentic,omitempty"              table:"authentic"`
+	IsFreeShip      bool    `json:"is_freeship,omitempty"               table:"freeship"`
+	Location        string  `json:"location,omitempty"                  table:"location"`
+	FetchedAt       string  `json:"fetched_at,omitempty"                table:"fetched_at"`
+}
+
+// --- client methods ---
+
+// GetProduct fetches full details for a single product by numeric ID.
+func (c *Client) GetProduct(ctx context.Context, id string) (*Product, error) {
+	base := c.cfg.BaseURL
+	if base == "" {
+		base = baseURL
 	}
-	var out []*Page
+	apiURL := base + "/api/v2/product/detail/" + id
+	body, err := c.Get(ctx, apiURL)
+	if err != nil {
+		return nil, fmt.Errorf("product %s: %w", id, err)
+	}
+
+	var resp wireDetailResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode product %s: %w", id, err)
+	}
+	if resp.Result.ID == 0 {
+		return nil, fmt.Errorf("product %s: not found in response", id)
+	}
+	return productFromWire(resp.Result, base), nil
+}
+
+// SearchProducts fetches products matching a search query from the listing HTML.
+func (c *Client) SearchProducts(ctx context.Context, query string, limit int) ([]*Product, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	base := c.cfg.BaseURL
+	if base == "" {
+		base = baseURL
+	}
+	params := url.Values{}
+	params.Set("q", query)
+	params.Set("page", "1")
+	pageURL := base + "/ket-qua-tim-kiem/?" + params.Encode()
+
+	body, err := c.Get(ctx, pageURL)
+	if err != nil {
+		return nil, fmt.Errorf("search %q: %w", query, err)
+	}
+	return parseListingHTML(body, limit, base), nil
+}
+
+// CategoryProducts fetches products from a category listing page.
+func (c *Client) CategoryProducts(ctx context.Context, slug string, limit int) ([]*Product, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	base := c.cfg.BaseURL
+	if base == "" {
+		base = baseURL
+	}
+	pageURL := base + "/" + slug + "/"
+	body, err := c.Get(ctx, pageURL)
+	if err != nil {
+		return nil, fmt.Errorf("category %s: %w", slug, err)
+	}
+	return parseListingHTML(body, limit, base), nil
+}
+
+// --- HTML parsing ---
+
+// productLinkRE finds product links in Sendo listing HTML.
+// Pattern: href="/something-123456789.html" where the trailing digits are the product ID.
+var productLinkRE = regexp.MustCompile(`href="(?:https://www\.sendo\.vn)?(/[^"]+?-(\d{7,})\.html)"`)
+
+// jsonLdRE finds a JSON-LD Product block in HTML.
+var jsonLdRE = regexp.MustCompile(`(?is)<script[^>]+type="application/ld\+json"[^>]*>([\s\S]*?)</script>`)
+
+// priceRE finds a price in a JSON-LD Product block.
+var priceRE = regexp.MustCompile(`"price"\s*:\s*"?([\d.]+)"?`)
+
+// namePropRE finds the name in a JSON-LD Product block.
+var namePropRE = regexp.MustCompile(`"name"\s*:\s*"([^"]+)"`)
+
+func parseListingHTML(body []byte, limit int, base string) []*Product {
+	html := string(body)
+	// First try JSON-LD blocks for structured product data.
+	products := parseFromJSONLD(html, limit, base)
+	if len(products) > 0 {
+		return products
+	}
+	// Fall back to link extraction.
+	return parseFromLinks(html, limit, base)
+}
+
+func parseFromJSONLD(html string, limit int, base string) []*Product {
+	matches := jsonLdRE.FindAllStringSubmatch(html, -1)
+	var out []*Product
 	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
+
+	for _, m := range matches {
+		if len(out) >= limit {
 			break
 		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
+		block := m[1]
+		if !strings.Contains(block, `"Product"`) {
+			continue
 		}
+		// Extract product ID from URL in JSON-LD.
+		urlM := productLinkRE.FindStringSubmatch(block)
+		if len(urlM) < 3 {
+			continue
+		}
+		id := urlM[2]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+
+		name := ""
+		if nm := namePropRE.FindStringSubmatch(block); len(nm) >= 2 {
+			name = strings.ReplaceAll(nm[1], `\"`, `"`)
+		}
+		price := 0.0
+		if pm := priceRE.FindStringSubmatch(block); len(pm) >= 2 {
+			price, _ = strconv.ParseFloat(pm[1], 64)
+		}
+
+		out = append(out, &Product{
+			ID:        id,
+			Name:      name,
+			URL:       base + urlM[1],
+			Price:     price,
+			FetchedAt: time.Now().UTC().Format(time.RFC3339),
+		})
 	}
 	return out
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+func parseFromLinks(html string, limit int, base string) []*Product {
+	matches := productLinkRE.FindAllStringSubmatch(html, -1)
+	seen := map[string]bool{}
+	var out []*Product
+
+	for _, m := range matches {
+		if len(out) >= limit {
+			break
+		}
+		if len(m) < 3 {
+			continue
+		}
+		id := m[2]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, &Product{
+			ID:        id,
+			URL:       base + m[1],
+			FetchedAt: time.Now().UTC().Format(time.RFC3339),
+		})
 	}
-	return s
+	return out
+}
+
+// productFromWire converts the internal API response to a public Product.
+func productFromWire(w wireProduct, base string) *Product {
+	if base == "" {
+		base = baseURL
+	}
+	productURL := base + "/" + strconv.FormatInt(w.ID, 10) + ".html"
+	return &Product{
+		ID:              strconv.FormatInt(w.ID, 10),
+		Name:            w.Name,
+		URL:             productURL,
+		Price:           w.Price,
+		OriginalPrice:   w.OriginalPrice,
+		DiscountPercent: w.DiscountPercent,
+		SellerName:      w.Seller.Name,
+		SellerRating:    w.Seller.Rating,
+		Rating:          w.Rating,
+		ReviewCount:     w.ReviewCount,
+		SoldCount:       w.SoldCount,
+		IsAuthentic:     w.IsAuthentic,
+		IsFreeShip:      w.IsFreeShip,
+		Location:        w.Location,
+		FetchedAt:       time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+// productIDRE extracts the trailing numeric ID from a Sendo product URL.
+// Pattern: /{slug}-{id}.html where id is 7+ digits.
+var productIDRE = regexp.MustCompile(`-(\d{7,})\.html`)
+
+// extractProductID extracts the numeric product ID from a Sendo URL.
+func extractProductID(rawURL string) string {
+	m := productIDRE.FindStringSubmatch(rawURL)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
 }
